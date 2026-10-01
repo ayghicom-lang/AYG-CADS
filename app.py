@@ -353,7 +353,7 @@ else:
     st.sidebar.info("Sila muat naik fail data untuk memulakan sesi.")
 
 st.sidebar.divider()
-st.sidebar.caption("AYG CADS - Enjin Multi-Branch Tempatan")
+st.sidebar.caption("AYG CADS v1.1.0 - Multi-Branch Engine")
 
 # ==========================================
 # 5. MAIN UI
@@ -605,5 +605,3 @@ else:
     with tab4: st.info("Sila pilih bulan di menu sisi untuk melihat analitik.")
     with tab5: st.info("Sila pilih bulan di menu sisi untuk melihat analitik.")
     st.sidebar.divider()
-    
-st.sidebar.caption("AYG CADS v1.1.0 - Multi-Branch Engine")
