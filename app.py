@@ -1,5 +1,8 @@
+# --- START OF FILE app.py ---
+
 import streamlit as st
 import pandas as pd
+import numpy as np
 import data_engine as de
 import requests
 import os
@@ -21,19 +24,75 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# Use this function later when you move your data_engine logic to the backend!
 def get_data_from_backend(endpoint, payload=None):
     try:
         url = f"{BACKEND_URL}/{endpoint}"
         response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status() # Check for errors
+        response.raise_for_status() 
         return response.json()
     except Exception as e:
         st.error(f"Ralat Sambungan Pelayan: {e}")
         return None
 
 # ==========================================
-# 1. SESSION STATE INITIALIZATION
+# 1. DATA NORMALIZATION ENGINE (MULTI-BRANCH)
+# ==========================================
+def normalize_raw_data(df, file_name=""):
+    """
+    Acts as a Universal Adapter for different Google Form schemas across Branches.
+    Standardizes differing columns (like Bangi's 14 name columns) into a single schema.
+    """
+    standard_df = pd.DataFrame()
+
+    # 1. Cawangan Detection
+    if 'AYG Bangi' in str(df.columns) or 'bangi' in file_name.lower():
+        standard_df['cawangan'] = 'Bangi'
+    elif 'Column 1' in df.columns or 'kota damansara' in file_name.lower():
+        standard_df['cawangan'] = 'Kota Damansara'
+    else:
+        standard_df['cawangan'] = 'Cawangan Lain'
+
+    # 2. Normalize Timestamp
+    time_cols = [col for col in df.columns if 'timestamp' in col.lower() or 'column 1' in col.lower() or 'tarikh' in col.lower()]
+    if time_cols:
+        standard_df['datetime'] = df[time_cols[0]]
+    else:
+        standard_df['datetime'] = pd.NaT
+
+    # 3. Normalize Name (Intercepts Branching Logic giving 14 name columns)
+    name_cols = [col for col in df.columns if 'nama' in col.lower()]
+    if name_cols:
+        # Replaces empty strings with NaN, backfills across columns to find the single written name
+        standard_df['name'] = df[name_cols].replace(r'^\s*$', np.nan, regex=True).bfill(axis=1).iloc[:, 0]
+    else:
+        standard_df['name'] = "Unknown"
+
+    # 4. Normalize Age
+    age_cols = [col for col in df.columns if 'umur' in col.lower()]
+    if age_cols:
+        standard_df['raw_age_category'] = df[age_cols[0]]
+    else:
+        standard_df['raw_age_category'] = "N/A"
+
+    # 5. Normalize Activity
+    act_cols = [col for col in df.columns if 'aktiviti' in col.lower() or 'perkara' in col.lower()]
+    if act_cols:
+        standard_df['activity'] = df[act_cols[0]]
+    else:
+        standard_df['activity'] = "N/A"
+        
+    # 6. Normalize Gender
+    gender_cols = [col for col in df.columns if 'jantina' in col.lower()]
+    if gender_cols:
+        standard_df['gender'] = df[gender_cols[0]]
+    else:
+        standard_df['gender'] = "N/A"
+
+    return standard_df
+
+
+# ==========================================
+# 2. SESSION STATE INITIALIZATION
 # ==========================================
 if 'processed_df' not in st.session_state:
     st.session_state['processed_df'] = None
@@ -47,16 +106,24 @@ if 'effective_df' not in st.session_state:
     st.session_state['effective_df'] = None
 
 # ==========================================
-# 2. ACTIONS / CALLBACKS
+# 3. ACTIONS / CALLBACKS
 # ==========================================
 def handle_upload():
     if st.session_state.file_upload is not None:
         try:
+            # Parse raw uploaded file via data engine
             raw_df = de.parse_uploaded_file(st.session_state.file_upload)
-            processed_df = de.process_raw_data(raw_df)
+            file_name = st.session_state.file_upload.name
+            
+            # Magic Step: Normalize raw data regardless of branch schema
+            normalized_df = normalize_raw_data(raw_df, file_name)
+            
+            # Pass unified schema into your original processing engine
+            processed_df = de.process_raw_data(normalized_df)
+            
             st.session_state['processed_df'] = processed_df
             update_effective_df()
-            st.toast("✅ File processed successfully!", icon="🎉")
+            st.toast(f"✅ Fail {file_name} dinormalisasi & diproses berjaya!", icon="🎉")
         except Exception as e:
             st.error(f"Error processing file: {e}")
 
@@ -100,9 +167,39 @@ def eliminate_record(original_name):
     st.warning(f"🗑️ Rekod untuk '{original_name}' telah dihapuskan.")
     st.rerun()
 
+# --- NEW: FORCE RESET ACTION ---
+def force_reset_new_attendees(sel_tb):
+    if st.session_state['effective_df'] is None: return 0
+    
+    df_all = st.session_state['effective_df']
+    analytics_df_all = df_all[df_all['review_status'] == 'Reviewed']
+    
+    if analytics_df_all.empty: return 0
+    
+    # 1. Identifikasi siapa 'Kehadiran Baru' pada bulan ini
+    min_dates = analytics_df_all.groupby('profile_id')['TahunBulan'].min().reset_index()
+    new_prof_ids = min_dates[min_dates['TahunBulan'] == sel_tb]['profile_id'].tolist()
+    
+    # 2. Cari nama mentah (raw name) yang berhubung dengan profile_id baru tersebut
+    target_rows = df_all[(df_all['profile_id'].isin(new_prof_ids)) & (df_all['TahunBulan'] == sel_tb)]
+    raw_names_to_reset = target_rows['name'].unique().tolist()
+    
+    # 3. Buang nama-nama ini dari memori (Ini akan memulangkan status mereka ke 'Pending Review')
+    reset_count = 0
+    for raw_name in raw_names_to_reset:
+        if raw_name in st.session_state['new_profiles']:
+            del st.session_state['new_profiles'][raw_name]
+            reset_count += 1
+        if raw_name in st.session_state['alias_map']:
+            del st.session_state['alias_map'][raw_name]
+            reset_count += 1
+            
+    update_effective_df()
+    return reset_count
+
 
 # ==========================================
-# 3. SIDEBAR & FILE UPLOAD
+# 4. SIDEBAR & FILE UPLOAD
 # ==========================================
 st.sidebar.title("AYG CADS Settings")
 
@@ -139,7 +236,7 @@ st.sidebar.caption("AYG Centralized Automated Database System - Mod Enjin Tempat
 
 
 # ==========================================
-# 4. MAIN UI
+# 5. MAIN UI
 # ==========================================
 st.title("🛡️ AYG Centralized Automated Database System")
 
@@ -198,10 +295,11 @@ with tab1:
         with st.container(border=True):
             c1, c2, c3 = st.columns(3)
             c1.write(f"**Pertama kali dilihat (bulan ini):** {sample_record['datetime']}")
-            c1.write(f"**Rumah:** {sample_record['raw_house'] or 'N/A'}")
-            c2.write(f"**Input umur:** {sample_record['raw_age_category']}")
-            c2.write(f"**Input jantina:** {sample_record['gender'] or 'N/A'}")
-            c3.write(f"**Aktiviti:** {sample_record['activity'] or 'N/A'}")
+            # Use dictionary safe fetching via .get to prevent errors if column missing
+            c1.write(f"**Rumah:** {sample_record.get('raw_house', 'N/A')}")
+            c2.write(f"**Input umur:** {sample_record.get('raw_age_category', 'N/A')}")
+            c2.write(f"**Input jantina:** {sample_record.get('gender', 'N/A')}")
+            c3.write(f"**Aktiviti:** {sample_record.get('activity', 'N/A')}")
             c3.write(f"**Kekerapan:** {len(pending_df_month[pending_df_month['name'] == target_name])} kali")
             
         st.write("")
@@ -222,12 +320,18 @@ with tab1:
             with st.form("new_prof_form", border=True):
                 new_clean_name = st.text_input("Nama Penuh (Bersih):", value=target_name)
                 f1, f2 = st.columns(2)
-                sug_age = sample_record['age'] if sample_record['age'] > 0 else 12
+                
+                # Fetching suggested age safely
+                sug_age = sample_record.get('age', 12)
+                if pd.isna(sug_age) or sug_age <= 0: sug_age = 12
+                
                 new_age = f1.number_input("Umur Tepat:", min_value=1, max_value=99, value=int(sug_age))
                 
                 sug_g_idx = 0
-                if sample_record['gender'] == 'Lelaki': sug_g_idx = 1
-                elif sample_record['gender'] == 'Perempuan': sug_g_idx = 2
+                sample_gender = str(sample_record.get('gender', '')).lower()
+                if 'lelaki' in sample_gender: sug_g_idx = 1
+                elif 'perempuan' in sample_gender: sug_g_idx = 2
+                
                 new_gender = f2.selectbox("Jantina:", ["-- Pilih --", "Lelaki", "Perempuan"], index=sug_g_idx)
                 
                 if st.form_submit_button("Cipta & Semak", use_container_width=True):
@@ -241,6 +345,23 @@ with tab1:
         st.write("---")
         if st.button("🗑️ Hapus Kemasukan Mengelirukan/Spam", type="secondary", use_container_width=True):
             eliminate_record(target_name)
+
+    # --- FORCE RESET BUTTON ZONE ---
+    st.write("")
+    st.write("")
+    with st.expander("⚠️ Zon Bahaya: Force Reset Kehadiran Baru", expanded=False):
+        st.warning(
+            "Fungsi ini akan **membatalkan Triage** bagi semua individu yang direkodkan sebagai "
+            "**'Kehadiran Baru'** pada bulan ini. Mereka akan dikembalikan ke senarai 'Triage' untuk disemak semula. "
+            "Gunakan fungsi ini jika admin tersilap klik 'Cipta Profail Baru' untuk pelajar yang sebenarnya telah sedia ada."
+        )
+        if st.button("🔄 Force Reset Data Kehadiran Baru Bulan Ini", type="primary"):
+            res_count = force_reset_new_attendees(sel_tb)
+            if res_count > 0:
+                st.success(f"Berjaya membatalkan semakan. {res_count} profil nama telah dikembalikan ke Triage.")
+            else:
+                st.info("Tiada data Kehadiran Baru untuk di-reset pada bulan ini.")
+            st.rerun()
 
 # ----------------- Helper for Analytics -----------------
 analytics_df_all = df_all[df_all['review_status'] == 'Reviewed']
@@ -307,6 +428,7 @@ else:
             unique_students = current_df.drop_duplicates(subset=['profile_id'])
             
             def count_age_range(min_age, max_age):
+                if 'age' not in unique_students.columns: return 0
                 return len(unique_students[(unique_students['age'] >= min_age) & (unique_students['age'] <= max_age)])
             
             a1, a2, a3, a4, a5, a6 = st.columns(6)
@@ -335,24 +457,28 @@ else:
             s1, s2 = st.columns(2)
             with s1:
                 st.subheader("Berdasarkan Jantina")
-                st.bar_chart(current_df['gender'].value_counts(), color="#1E88E5")
+                if 'gender' in current_df.columns:
+                    st.bar_chart(current_df['gender'].value_counts(), color="#1E88E5")
                 
                 st.subheader("Hari Paling Sibuk")
-                day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-                day_counts = current_df['DayOfWeek'].value_counts().reindex(day_order).fillna(0)
-                st.line_chart(day_counts, color="#E53935")
+                if 'DayOfWeek' in current_df.columns:
+                    day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                    day_counts = current_df['DayOfWeek'].value_counts().reindex(day_order).fillna(0)
+                    st.line_chart(day_counts, color="#E53935")
 
             with s2:
                 st.subheader("Pecahan Kategori Umur")
-                bins = [0, 6, 9, 12, 15, 17, 99]
-                labels = ['0-6', '7-9', '10-12', '13-15', '16-17', '18+']
-                age_buckets = pd.cut(current_df['age'], bins=bins, labels=labels, right=True).value_counts()
-                st.bar_chart(age_buckets, color="#8E24AA")
+                if 'age' in current_df.columns:
+                    bins = [0, 6, 9, 12, 15, 17, 99]
+                    labels = ['0-6', '7-9', '10-12', '13-15', '16-17', '18+']
+                    age_buckets = pd.cut(current_df['age'], bins=bins, labels=labels, right=True).value_counts()
+                    st.bar_chart(age_buckets, color="#8E24AA")
                 
                 st.subheader("Waktu Puncak Harian (Ikut Jam)")
-                hour_counts = current_df['datetime'].dt.hour.value_counts().sort_index()
-                hour_counts.index = hour_counts.index.map(lambda h: f"{h:02d}:00")
-                st.line_chart(hour_counts, color="#FFCA28")
+                if 'datetime' in current_df.columns:
+                    hour_counts = current_df['datetime'].dt.hour.value_counts().sort_index()
+                    hour_counts.index = hour_counts.index.map(lambda h: f"{h:02d}:00")
+                    st.line_chart(hour_counts, color="#FFCA28")
 
     # --- TAB 4: ACTIVITY REPORTING ---
     with tab4:
@@ -384,42 +510,43 @@ else:
             st.info("Tiada data untuk disemak.")
         else:
             st.subheader("1. Pilih Tarikh Untuk Disemak")
-            available_dates = sorted(current_df['date'].unique().tolist())
-            selected_date = st.selectbox("Tarikh:", available_dates)
-            
-            if selected_date:
-                raw_day_df = current_df[current_df['date'] == selected_date].copy()
-                dedup_day_df = raw_day_df.drop_duplicates(subset=['profile_id', 'date']).copy()
+            if 'date' in current_df.columns:
+                available_dates = sorted(current_df['date'].unique().tolist())
+                selected_date = st.selectbox("Tarikh:", available_dates)
                 
-                st.write("---")
-                col_a, col_b = st.columns(2)
-                
-                with col_a:
-                    st.markdown(f"### 📥 Borang Mentah (Jumlah: **{len(raw_day_df)}**)")
-                    st.dataframe(raw_day_df[['name', 'datetime', 'activity']], use_container_width=True)
+                if selected_date:
+                    raw_day_df = current_df[current_df['date'] == selected_date].copy()
+                    dedup_day_df = raw_day_df.drop_duplicates(subset=['profile_id', 'date']).copy()
                     
-                with col_b:
-                    st.markdown(f"### 🎯 Kehadiran Selepas Deduplikasi (Jumlah: **{len(dedup_day_df)}**)")
-                    st.dataframe(dedup_day_df[['name', 'datetime', 'activity']], use_container_width=True)
-                
-                st.write("---")
-                st.subheader("2. Kenalpasti Pendua (Pengecam Pendua)")
-                
-                counts = raw_day_df['name'].value_counts()
-                dupes = counts[counts > 1]
-                
-                if not dupes.empty:
-                    st.warning(f"⚠️ Terdapat **{len(dupes)}** individu yang menghantar borang lebih dari sekali pada tarikh ini.")
-                    st.table(dupes.reset_index().rename(columns={'name': 'Nama', 'count': 'Jumlah Hantar Borang'}))
-                else:
-                    st.success("✅ Tiada penghantaran borang pendua dikesan pada tarikh ini.")
-                
-                st.write("---")
-                st.subheader("3. Export Untuk Semakan Manual")
-                st.download_button(
-                    label="📥 Muat Turun Data Bersih (CSV)",
-                    data=dedup_day_df.to_csv(index=False).encode('utf-8'),
-                    file_name=f"AYG_Kehadiran_Bersih_{selected_date}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+                    st.write("---")
+                    col_a, col_b = st.columns(2)
+                    
+                    with col_a:
+                        st.markdown(f"### 📥 Borang Mentah (Jumlah: **{len(raw_day_df)}**)")
+                        st.dataframe(raw_day_df[['name', 'datetime', 'activity']], use_container_width=True)
+                        
+                    with col_b:
+                        st.markdown(f"### 🎯 Kehadiran Selepas Deduplikasi (Jumlah: **{len(dedup_day_df)}**)")
+                        st.dataframe(dedup_day_df[['name', 'datetime', 'activity']], use_container_width=True)
+                    
+                    st.write("---")
+                    st.subheader("2. Kenalpasti Pendua (Pengecam Pendua)")
+                    
+                    counts = raw_day_df['name'].value_counts()
+                    dupes = counts[counts > 1]
+                    
+                    if not dupes.empty:
+                        st.warning(f"⚠️ Terdapat **{len(dupes)}** individu yang menghantar borang lebih dari sekali pada tarikh ini.")
+                        st.table(dupes.reset_index().rename(columns={'name': 'Nama', 'count': 'Jumlah Hantar Borang'}))
+                    else:
+                        st.success("✅ Tiada penghantaran borang pendua dikesan pada tarikh ini.")
+                    
+                    st.write("---")
+                    st.subheader("3. Export Untuk Semakan Manual")
+                    st.download_button(
+                        label="📥 Muat Turun Data Bersih (CSV)",
+                        data=dedup_day_df.to_csv(index=False).encode('utf-8'),
+                        file_name=f"AYG_Kehadiran_Bersih_{selected_date}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
