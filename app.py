@@ -1,9 +1,6 @@
-# --- START OF FILE app.py ---
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import data_engine as de
 import requests
 import os
 
@@ -12,13 +9,8 @@ st.set_page_config(page_title="AYG CADS Control Panel", layout="wide")
 # ==========================================
 # 0. BACKEND SERVER CONFIGURATION
 # ==========================================
-# Safely load the token from the server's environment (.env file)
 HF_TOKEN = os.getenv("HF_TOKEN")
-
-# The direct URL to your Hugging Face space
 BACKEND_URL = "https://adabyouthgarage-ayg-hicom-backend-server-space.hf.space"
-
-# Headers containing your secret token to unlock the private space
 headers = {
     "Authorization": f"Bearer {HF_TOKEN}",
     "Content-Type": "application/json"
@@ -35,61 +27,97 @@ def get_data_from_backend(endpoint, payload=None):
         return None
 
 # ==========================================
-# 1. DATA NORMALIZATION ENGINE (MULTI-BRANCH)
+# 1. UNIVERSAL DATA PARSER ENGINE (BYPASS data_engine.py)
 # ==========================================
-def normalize_raw_data(df, file_name=""):
+def process_and_standardize_data(file):
     """
-    Acts as a Universal Adapter for different Google Form schemas across Branches.
-    Standardizes differing columns (like Bangi's 14 name columns) into a single schema.
+    Enjin pembacaan fail universal untuk kesemua 12 Cawangan AYG.
+    Ia membaca CSV secara terus dan mengatasi isu 'Timestamp' yang rapuh.
     """
+    # 1. Baca fail dengan selamat
+    if file.name.endswith('.csv'):
+        df = pd.read_csv(file)
+    else:
+        df = pd.read_excel(file)
+        
+    # Bersihkan nama lajur (buang BOM \ufeff dan ruang kosong yang tersembunyi)
+    df.columns = [str(c).strip('\ufeff').strip() for c in df.columns]
+    
     standard_df = pd.DataFrame()
-
-    # 1. Cawangan Detection
-    if 'AYG Bangi' in str(df.columns) or 'bangi' in file_name.lower():
-        standard_df['cawangan'] = 'Bangi'
-    elif 'Column 1' in df.columns or 'kota damansara' in file_name.lower():
-        standard_df['cawangan'] = 'Kota Damansara'
-    else:
-        standard_df['cawangan'] = 'Cawangan Lain'
-
-    # 2. Normalize Timestamp
-    time_cols = [col for col in df.columns if 'timestamp' in col.lower() or 'column 1' in col.lower() or 'tarikh' in col.lower()]
-    if time_cols:
-        standard_df['datetime'] = df[time_cols[0]]
-    else:
-        standard_df['datetime'] = pd.NaT
-
-    # 3. Normalize Name (Intercepts Branching Logic giving 14 name columns)
-    name_cols = [col for col in df.columns if 'nama' in col.lower()]
+    
+    # 2. Extract Tarikh & Masa (Menyokong 'Timestamp', 'Column 1', 'Tarikh')
+    time_cols = [c for c in df.columns if 'timestamp' in c.lower() or 'column 1' in c.lower() or 'tarikh' in c.lower()]
+    if not time_cols: 
+        raise ValueError("Lajur masa (Timestamp/Column 1) tidak dijumpai dalam fail ini.")
+    standard_df['raw_time'] = df[time_cols[0]]
+    
+    # 3. Extract Nama (Menyokong berbilang lajur untuk Cawangan Bangi)
+    name_cols = [c for c in df.columns if 'nama' in c.lower()]
     if name_cols:
-        # Replaces empty strings with NaN, backfills across columns to find the single written name
         standard_df['name'] = df[name_cols].replace(r'^\s*$', np.nan, regex=True).bfill(axis=1).iloc[:, 0]
     else:
-        standard_df['name'] = "Unknown"
-
-    # 4. Normalize Age
-    age_cols = [col for col in df.columns if 'umur' in col.lower()]
-    if age_cols:
-        standard_df['raw_age_category'] = df[age_cols[0]]
-    else:
-        standard_df['raw_age_category'] = "N/A"
-
-    # 5. Normalize Activity
-    act_cols = [col for col in df.columns if 'aktiviti' in col.lower() or 'perkara' in col.lower()]
-    if act_cols:
-        standard_df['activity'] = df[act_cols[0]]
-    else:
-        standard_df['activity'] = "N/A"
+        standard_df['name'] = "Tidak Diketahui"
+    
+    # Bersihkan nama (Huruf besar & buang ruang kosong)
+    standard_df['name'] = standard_df['name'].astype(str).str.strip().str.upper()
+    
+    # 4. Extract Umur
+    age_cols = [c for c in df.columns if 'umur' in c.lower()]
+    standard_df['raw_age_category'] = df[age_cols[0]] if age_cols else "N/A"
+    standard_df['age'] = standard_df['raw_age_category'].astype(str).str.extract(r'(\d+)').fillna(12).astype(int)
+    
+    # 5. Extract Aktiviti (Kota Damansara tiada lajur ini, sistem tak akan crash)
+    act_cols = [c for c in df.columns if 'aktiviti' in c.lower() or 'perkara' in c.lower()]
+    standard_df['activity'] = df[act_cols[0]] if act_cols else "N/A"
+    
+    # 6. Extract Jantina & Rumah (Jika ada)
+    gender_cols = [c for c in df.columns if 'jantina' in c.lower()]
+    standard_df['gender'] = df[gender_cols[0]] if gender_cols else "N/A"
+    house_cols = [c for c in df.columns if 'rumah' in c.lower()]
+    standard_df['raw_house'] = df[house_cols[0]] if house_cols else "N/A"
+    
+    # 7. Pemprosesan Tarikh Pintar (Mengendalikan format Bangi GMT+8 & format Kota Damansara)
+    standard_df['raw_time'] = standard_df['raw_time'].astype(str).str.replace(r'GMT\+8', '', regex=True).str.strip()
+    standard_df['datetime'] = pd.to_datetime(standard_df['raw_time'], errors='coerce', dayfirst=True)
+    standard_df = standard_df.dropna(subset=['datetime']) # Buang baris kosong/rosak
+    
+    if standard_df.empty:
+        raise ValueError("Tiada data tarikh yang sah dapat diproses.")
         
-    # 6. Normalize Gender
-    gender_cols = [col for col in df.columns if 'jantina' in col.lower()]
-    if gender_cols:
-        standard_df['gender'] = df[gender_cols[0]]
-    else:
-        standard_df['gender'] = "N/A"
-
+    # Standard Date Columns untuk Sistem Analitik
+    standard_df['TahunBulan'] = standard_df['datetime'].dt.strftime('%Y-%m')
+    standard_df['date'] = standard_df['datetime'].dt.date
+    standard_df['DayOfWeek'] = standard_df['datetime'].dt.day_name()
+    
+    # Setup Triage
+    standard_df['review_status'] = 'Pending Review'
+    standard_df['profile_id'] = standard_df['name']
+    
     return standard_df
 
+# Engine untuk Triage (Bypass de.get_effective_df)
+def apply_triage_rules(df, alias_map, eliminated_names, new_profiles):
+    if df is None or df.empty: return df
+    df = df.copy()
+    
+    def map_profile(row):
+        n = row['name']
+        if n in eliminated_names:
+            return 'Eliminated', n, row['age'], row['gender']
+        elif n in alias_map:
+            return 'Reviewed', alias_map[n], row['age'], row['gender']
+        elif n in new_profiles:
+            p = new_profiles[n]
+            return 'Reviewed', p['clean_name'], p['age'], p['gender']
+        else:
+            return 'Pending Review', n, row['age'], row['gender']
+            
+    res = df.apply(map_profile, axis=1, result_type='expand')
+    df['review_status'] = res[0]
+    df['profile_id'] = res[1]
+    df['age'] = res[2]
+    df['gender'] = res[3]
+    return df
 
 # ==========================================
 # 2. SESSION STATE INITIALIZATION
@@ -111,25 +139,18 @@ if 'effective_df' not in st.session_state:
 def handle_upload():
     if st.session_state.file_upload is not None:
         try:
-            # Parse raw uploaded file via data engine
-            raw_df = de.parse_uploaded_file(st.session_state.file_upload)
-            file_name = st.session_state.file_upload.name
-            
-            # Magic Step: Normalize raw data regardless of branch schema
-            normalized_df = normalize_raw_data(raw_df, file_name)
-            
-            # Pass unified schema into your original processing engine
-            processed_df = de.process_raw_data(normalized_df)
+            # 🛡️ PINTAS data_engine.py SEPENUHNYA! (Mengelakkan error 'Timestamp')
+            processed_df = process_and_standardize_data(st.session_state.file_upload)
             
             st.session_state['processed_df'] = processed_df
             update_effective_df()
-            st.toast(f"✅ Fail {file_name} dinormalisasi & diproses berjaya!", icon="🎉")
+            st.toast("✅ Fail berjaya dibaca dan dinormalisasi!", icon="🎉")
         except Exception as e:
-            st.error(f"Error processing file: {e}")
+            st.error(f"Ralat sewaktu membaca fail: {e}")
 
 def update_effective_df():
     if st.session_state['processed_df'] is not None:
-        st.session_state['effective_df'] = de.get_effective_df(
+        st.session_state['effective_df'] = apply_triage_rules(
             st.session_state['processed_df'],
             st.session_state['alias_map'],
             st.session_state['eliminated_names'],
@@ -167,24 +188,19 @@ def eliminate_record(original_name):
     st.warning(f"🗑️ Rekod untuk '{original_name}' telah dihapuskan.")
     st.rerun()
 
-# --- NEW: FORCE RESET ACTION ---
 def force_reset_new_attendees(sel_tb):
     if st.session_state['effective_df'] is None: return 0
-    
     df_all = st.session_state['effective_df']
     analytics_df_all = df_all[df_all['review_status'] == 'Reviewed']
     
     if analytics_df_all.empty: return 0
     
-    # 1. Identifikasi siapa 'Kehadiran Baru' pada bulan ini
     min_dates = analytics_df_all.groupby('profile_id')['TahunBulan'].min().reset_index()
     new_prof_ids = min_dates[min_dates['TahunBulan'] == sel_tb]['profile_id'].tolist()
     
-    # 2. Cari nama mentah (raw name) yang berhubung dengan profile_id baru tersebut
     target_rows = df_all[(df_all['profile_id'].isin(new_prof_ids)) & (df_all['TahunBulan'] == sel_tb)]
     raw_names_to_reset = target_rows['name'].unique().tolist()
     
-    # 3. Buang nama-nama ini dari memori (Ini akan memulangkan status mereka ke 'Pending Review')
     reset_count = 0
     for raw_name in raw_names_to_reset:
         if raw_name in st.session_state['new_profiles']:
@@ -196,6 +212,15 @@ def force_reset_new_attendees(sel_tb):
             
     update_effective_df()
     return reset_count
+
+# Helper Functions
+def get_available_months(df):
+    if df is None or df.empty: return []
+    return sorted(df['TahunBulan'].unique().tolist(), reverse=True)
+
+def get_existing_profiles(df):
+    if df is None or df.empty: return []
+    return sorted(df[df['review_status'] == 'Reviewed']['profile_id'].unique().tolist())
 
 
 # ==========================================
@@ -217,7 +242,7 @@ if st.session_state['processed_df'] is not None:
         st.rerun()
 
     st.sidebar.header("🗓️ Pilihan Tapisan")
-    months_available = de.get_available_months(st.session_state['processed_df'])
+    months_available = get_available_months(st.session_state['processed_df'])
     
     if months_available:
         malay_months = {"01": "Jan", "02": "Feb", "03": "Mac", "04": "April", "05": "Mei", "06": "Jun", "07": "Julai", "08": "Ogos", "09": "Sep", "10": "Okt", "11": "Nov", "12": "Dis"}
@@ -232,7 +257,7 @@ else:
     st.sidebar.info("Sila muat naik fail data untuk memulakan sesi.")
 
 st.sidebar.divider()
-st.sidebar.caption("AYG Centralized Automated Database System - Mod Enjin Tempatan")
+st.sidebar.caption("AYG CADS - Enjin Multi-Branch Tempatan")
 
 
 # ==========================================
@@ -241,7 +266,7 @@ st.sidebar.caption("AYG Centralized Automated Database System - Mod Enjin Tempat
 st.title("🛡️ AYG Centralized Automated Database System")
 
 if st.session_state['effective_df'] is None:
-    st.info("👋 Selamat Datang! Sila muat naik fail CSV atau Excel dari Google Forms di menu sisi (sidebar) untuk mula menjana laporan analitik.")
+    st.info("👋 Selamat Datang! Sila muat naik fail CSV dari mana-mana cawangan Google Forms (Bangi/KD/Hicom dll) di menu sisi untuk mula menjana laporan analitik.")
     st.stop()
 
 # Data setup for tabs
@@ -280,8 +305,7 @@ with tab1:
     c_p1.progress(progress, text=f"Kemajuan Semakan: {total_reviewed} rekod selesai / {total_records} jumlah rekod sah")
     c_p2.metric("Jumlah Nama Tertangguh", pending_count)
 
-    profiles_df = de.get_profiles(df_all)
-    profile_dict = dict(zip(profiles_df['name'], profiles_df['profile_id'])) if not profiles_df.empty else {}
+    existing_profiles = get_existing_profiles(df_all)
 
     if pending_count == 0:
         st.success(f"🎉 Tiada rekod tertangguh untuk {paparan_text}! Sistem dikategorikan 100%.")
@@ -295,25 +319,24 @@ with tab1:
         with st.container(border=True):
             c1, c2, c3 = st.columns(3)
             c1.write(f"**Pertama kali dilihat (bulan ini):** {sample_record['datetime']}")
-            # Use dictionary safe fetching via .get to prevent errors if column missing
             c1.write(f"**Rumah:** {sample_record.get('raw_house', 'N/A')}")
             c2.write(f"**Input umur:** {sample_record.get('raw_age_category', 'N/A')}")
             c2.write(f"**Input jantina:** {sample_record.get('gender', 'N/A')}")
             c3.write(f"**Aktiviti:** {sample_record.get('activity', 'N/A')}")
-            c3.write(f"**Kekerapan:** {len(pending_df_month[pending_df_month['name'] == target_name])} kali")
+            c3.write(f"**Kekerapan (Bulan ini):** {len(pending_df_month[pending_df_month['name'] == target_name])} kali")
             
         st.write("")
         col1, col2 = st.columns(2)
 
         with col1:
             st.markdown("#### 🔗 Pautkan ke Profail Sedia Ada")
-            selected_profile_name = st.selectbox("Cari nama sebenar:", options=["-- Pilih --"] + sorted(list(profile_dict.keys())), key="link_select")
+            selected_profile_name = st.selectbox("Cari nama sebenar:", options=["-- Pilih --"] + existing_profiles, key="link_select")
             
             if st.button("Pautkan & Semak", type="primary", use_container_width=True):
                 if selected_profile_name == "-- Pilih --": 
                     st.error("Sila pilih profail terlebih dahulu.")
                 else: 
-                    link_to_existing(target_name, profile_dict[selected_profile_name])
+                    link_to_existing(target_name, selected_profile_name)
                     
         with col2:
             st.markdown("#### ➕ Cipta Profail Baru")
@@ -321,7 +344,6 @@ with tab1:
                 new_clean_name = st.text_input("Nama Penuh (Bersih):", value=target_name)
                 f1, f2 = st.columns(2)
                 
-                # Fetching suggested age safely
                 sug_age = sample_record.get('age', 12)
                 if pd.isna(sug_age) or sug_age <= 0: sug_age = 12
                 
@@ -488,7 +510,7 @@ else:
         else:
             act_df = current_df[~current_df['activity'].isin(['', 'N/A', 'N/a', 'None'])]
             if act_df.empty:
-                st.info("Tiada data aktiviti yang sah.")
+                st.info("Tiada data aktiviti yang sah atau cawangan ini tiada rekod aktiviti.")
             else:
                 a1, a2 = st.columns([1, 2])
                 with a1:
